@@ -1,0 +1,264 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include "esp_wifi.h"
+#include <Adafruit_NeoPixel.h>
+#include <DHTesp.h>
+
+//   Board 1:  #define MY_NAME "VIVEK"
+//   Board 2:  #define MY_NAME "SUHANTH"
+#define MY_NAME "suhanth"
+// ************************************************
+
+// ===== NeoPixel =====
+#define RGB_PIN     5
+#define LED_COUNT   1
+#define LED_BRIGHT  100
+Adafruit_NeoPixel pixel(LED_COUNT, RGB_PIN, NEO_GRB + NEO_KHZ800);
+
+// ===== DHT Sensor =====
+#define DHT_PIN 2
+DHTesp dht;
+
+// Deep sleep & awake timings
+const uint64_t SLEEP_DURATION_US   = 10ULL * 1000000ULL;  // 10 seconds sleep
+const uint32_t AWAKE_DURATION_MS   = 10000UL;             // ~10s awake
+const uint32_t SEND_INTERVAL_MS    = 500UL;               // send every 500 ms
+
+// Temperature thresholds (C) – from your MQTT code
+const float ALARM_COLD = 0.0;
+const float WARN_COLD  = 10.0;
+const float WARN_HOT   = 25.0;
+const float ALARM_HOT  = 30.0;
+
+// ESP-NOW message structure
+typedef struct {
+  char  from[10];
+  float temp;
+  float hum;
+} message_t;
+
+message_t outgoingMessage;
+message_t incomingMessage;
+
+// Broadcast MAC address
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+// RX counter for this wake cycle
+volatile uint8_t rxCountThisCycle = 0;
+
+// ----------------- Helpers -----------------
+void printMac(const uint8_t* mac) {
+  for (int i = 0; i < 6; i++) {
+    if (i) Serial.print(":");
+    Serial.printf("%02X", mac[i]);
+  }
+}
+
+void setColor(uint8_t r, uint8_t g, uint8_t b) {
+  pixel.setPixelColor(0, pixel.Color(r, g, b));
+  pixel.show();
+}
+
+void setLedByTemperature(float tempC) {
+  uint8_t r = 0, g = 0, b = 0;
+
+  if (tempC < ALARM_COLD) {
+    r = 0; g = 0; b = 255;
+    Serial.println("LED: BLUE (Freezing)");
+  } else if (tempC < WARN_COLD) {
+    r = 0; g = 150; b = 150;
+    Serial.println("LED: TURQUOISE (Cold)");
+  } else if (tempC <= WARN_HOT) {
+    r = 0; g = 255; b = 0;
+    Serial.println("LED: GREEN (Normal)");
+  } else if (tempC < ALARM_HOT) {
+    r = 255; g = 200; b = 0;
+    Serial.println("LED: YELLOW (Hot)");
+  } else {
+    r = 255; g = 0; b = 0;
+    Serial.println("LED: RED (Very Hot)");
+  }
+
+  pixel.setPixelColor(0, pixel.Color(r, g, b));
+  pixel.show();
+}
+
+// ----------------- Callbacks -----------------
+
+// ESP-NOW Send callback
+void onSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
+  Serial.print("[");
+  Serial.print(MY_NAME);
+  Serial.print("] Send status: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
+}
+
+// ESP-NOW Receive callback
+void onReceive(const esp_now_recv_info *recv_info, const uint8_t *data, int len) {
+  rxCountThisCycle++;
+
+  Serial.println();
+  Serial.println("========= RECEIVED PACKET =========");
+
+  Serial.print("My Name: ");
+  Serial.println(MY_NAME);
+
+  Serial.print("From MAC: ");
+  printMac(recv_info->src_addr);
+  Serial.println();
+
+  if (len == sizeof(message_t)) {
+    memcpy(&incomingMessage, data, sizeof(message_t));
+
+    Serial.print("Sender: ");
+    Serial.println(incomingMessage.from);
+
+    Serial.print("Temp: ");
+    Serial.print(incomingMessage.temp);
+    Serial.println(" °C");
+
+    Serial.print("Hum: ");
+    Serial.print(incomingMessage.hum);
+    Serial.println(" %");
+
+    // Update LED based on received temperature (remote temp)
+    setLedByTemperature(incomingMessage.temp);
+  } else {
+    Serial.print("Invalid packet size: ");
+    Serial.println(len);
+  }
+
+  Serial.println("====================================");
+  Serial.println();
+}
+
+// ----------------- Setup -----------------
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  Serial.println("\n====================================");
+  Serial.print("Booting ");
+  Serial.println(MY_NAME);
+  Serial.println("====================================");
+
+  // Init NeoPixel
+  pixel.begin();
+  pixel.setBrightness(LED_BRIGHT);
+  setColor(50, 50, 50); // dim grey at boot
+
+  // Init DHT sensor (like in your MQTT code)
+  dht.setup(DHT_PIN, DHTesp::DHT11);
+  delay(1500); // allow sensor to stabilise
+
+  // Configure WiFi (station mode, fixed channel)
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+
+  uint8_t ch;
+  wifi_second_chan_t sch;
+  esp_wifi_get_channel(&ch, &sch);
+  Serial.print("WiFi channel: ");
+  Serial.println(ch);
+
+  Serial.print("My MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  // Init ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed!");
+    return;
+  }
+
+  esp_now_register_send_cb(onSent);
+  esp_now_register_recv_cb(onReceive);
+
+  // Add broadcast peer
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = ch;
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+
+  Serial.println("[INFO] ESP-NOW Ready");
+  Serial.println();
+
+  // Small phase offset so both boards are not perfectly in sync
+  if (String(MY_NAME) == "SUHANTH") {
+    Serial.println("[SUHANTH] Applying 1s phase offset before sends...");
+    delay(1000);
+  }
+
+  // ---------- Real DHT reading ----------
+  TempAndHumidity dhtData = dht.getTempAndHumidity();
+  float temp = dhtData.temperature;
+  float hum  = dhtData.humidity;
+
+  if (isnan(temp) || isnan(hum)) {
+    Serial.println("DHT read FAILED (NaN) – keeping LED as boot colour.");
+   
+  } else {
+    Serial.print("Temp: ");
+    Serial.print(temp);
+    Serial.print(" °C, Humidity: ");
+    Serial.print(hum);
+    Serial.println(" %");
+
+    // Local LED based on own temp (same as MQTT behaviour)
+    setLedByTemperature(temp);
+
+    // Prepare message
+    strncpy(outgoingMessage.from, MY_NAME, sizeof(outgoingMessage.from) - 1);
+    outgoingMessage.from[sizeof(outgoingMessage.from) - 1] = '\0';
+    outgoingMessage.temp = temp;
+    outgoingMessage.hum  = hum;
+  }
+
+  // ---------- Awake window: send multiple packets & listen ----------
+  rxCountThisCycle = 0;
+  unsigned long start = millis();
+  unsigned long lastSend = 0;
+  uint8_t sendCount = 0;
+
+  Serial.println("Staying awake for ~10 seconds, sending every 500 ms...");
+
+  while (millis() - start < AWAKE_DURATION_MS) {
+    unsigned long now = millis();
+
+    if (now - lastSend >= SEND_INTERVAL_MS) {
+      lastSend = now;
+      sendCount++;
+
+      esp_err_t result = esp_now_send(broadcastAddress,(uint8_t *)&outgoingMessage, sizeof(outgoingMessage));
+
+      Serial.print("[");
+      Serial.print(MY_NAME);
+      Serial.print("] Send #");
+      Serial.print(sendCount);
+      Serial.print(" -> ");
+      Serial.println(result == ESP_OK ? "OK" : "ERROR");
+    }
+
+    // Allow ESP-NOW/WiFi background tasks to run so RX callbacks fire
+    delay(10);
+  }
+
+  Serial.print("Awake window done, total sends: ");
+  Serial.println(sendCount);
+  Serial.print("Packets received this cycle: ");
+  Serial.println(rxCountThisCycle);
+
+  Serial.println("Entering deep sleep for 10 seconds...");
+  Serial.println("====================================");
+
+  // ---------- Enter deep sleep ----------
+  esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
+  esp_deep_sleep_start();
+}
+
+void loop() {
+  
+}
